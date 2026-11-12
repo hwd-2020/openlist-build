@@ -81,6 +81,10 @@ jobs:
             echo "ERROR: patch marker _txlock=immediate missing in binary"
             exit 1
           fi
+          if ! grep -q 'rclone_chunk' openlist; then
+            echo "ERROR: patch marker rclone_chunk missing in binary"
+            exit 1
+          fi
 
       - name: Publish release
         env:

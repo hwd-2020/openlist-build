@@ -1,0 +1,223 @@
+diff -urN a/drivers/chunk/driver.go b/drivers/chunk/driver.go
+--- a/drivers/chunk/driver.go
++++ b/drivers/chunk/driver.go
+@@ -7,6 +7,7 @@
+ 	"fmt"
+ 	"io"
+ 	stdpath "path"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -76,6 +77,11 @@
+ 
+ 	remoteActualDir, name := stdpath.Split(remoteActualPath)
+ 	chunkName := d.ChunkPrefix + name
++	if d.RcloneCompat {
++		if obj, rerr := d.getRcloneChunkObject(ctx, remoteStorage, stdpath.Dir(remoteActualPath), name, path); rerr == nil {
++			return obj, nil
++		}
++	}
+ 	chunkObjs, err := op.List(ctx, remoteStorage, stdpath.Join(remoteActualDir, chunkName), model.ListArgs{})
+ 	if err != nil {
+ 		return nil, err
+@@ -154,6 +160,90 @@
+ 	return &objRes, nil
+ }
+ 
++// rcloneChunkMarker is what rclone's chunker appends to every part name.
++const rcloneChunkMarker = ".rclone_chunk."
++
++// parseRclonePart splits "<base>.rclone_chunk.001" into "<base>" and 1.
++// The temporary objects rclone leaves behind when a move fails
++// ("<base>.rclone_chunk.001_ab12cd") are rejected because the suffix is not
++// purely numeric.
++func parseRclonePart(name string) (string, int, bool) {
++	i := strings.LastIndex(name, rcloneChunkMarker)
++	if i <= 0 {
++		return "", 0, false
++	}
++	suffix := name[i+len(rcloneChunkMarker):]
++	if len(suffix) < 3 {
++		return "", 0, false
++	}
++	for _, c := range suffix {
++		if c < '0' || c > '9' {
++			return "", 0, false
++		}
++	}
++	idx, err := strconv.Atoi(suffix)
++	if err != nil {
++		return "", 0, false
++	}
++	return name[:i], idx, true
++}
++
++func (d *Chunk) getRcloneChunkObject(ctx context.Context, remoteStorage driver.Driver, remoteDir, name, reqPath string) (model.Obj, error) {
++	objs, err := op.List(ctx, remoteStorage, remoteDir, model.ListArgs{})
++	if err != nil {
++		return nil, err
++	}
++	parts := make(map[int]model.Obj)
++	for _, obj := range objs {
++		if obj.IsDir() {
++			continue
++		}
++		if base, idx, ok := parseRclonePart(obj.GetName()); ok && base == name {
++			parts[idx] = obj
++		}
++	}
++	objRes, ok := newRcloneChunkObject(reqPath, name, parts)
++	if !ok {
++		return nil, errs.ObjectNotFound
++	}
++	return objRes, nil
++}
++
++func newRcloneChunkObject(reqPath, name string, parts map[int]model.Obj) (*chunkObject, bool) {
++	if len(parts) == 0 {
++		return nil, false
++	}
++	idxs := make([]int, 0, len(parts))
++	for i := range parts {
++		idxs = append(idxs, i)
++	}
++	sort.Ints(idxs)
++	names := make([]string, 0, len(idxs))
++	sizes := make([]int64, 0, len(idxs))
++	var total int64
++	var first model.Obj
++	for _, i := range idxs {
++		o := parts[i]
++		if first == nil {
++			first = o
++		}
++		names = append(names, o.GetName())
++		sizes = append(sizes, o.GetSize())
++		total += o.GetSize()
++	}
++	return &chunkObject{
++		Object: model.Object{
++			Path:     reqPath,
++			Name:     name,
++			Size:     total,
++			Modified: first.ModTime(),
++			Ctime:    first.CreateTime(),
++		},
++		chunkSizes: sizes,
++		partNames:  names,
++	}, true
++}
++
+ func (d *Chunk) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+ 	remoteStorage, remoteActualPath, err := op.GetStorageAndActualPath(d.RemotePath)
+ 	if err != nil {
+@@ -168,12 +258,35 @@
+ 		return nil, err
+ 	}
+ 	result := make([]model.Obj, 0, len(remoteObjs))
++	var rcloneParts map[string]map[int]model.Obj
++	if d.RcloneCompat {
++		rcloneParts = make(map[string]map[int]model.Obj)
++		for _, obj := range remoteObjs {
++			if obj.IsDir() {
++				continue
++			}
++			if base, idx, ok := parseRclonePart(obj.GetName()); ok {
++				m := rcloneParts[base]
++				if m == nil {
++					m = make(map[int]model.Obj)
++					rcloneParts[base] = m
++				}
++				m[idx] = obj
++			}
++		}
++	}
+ 	listG, listCtx := errgroup.NewGroupWithContext(ctx, d.NumListWorkers, retry.Attempts(3))
+ 	for _, obj := range remoteObjs {
+ 		if utils.IsCanceled(listCtx) {
+ 			break
+ 		}
+ 		rawName := obj.GetName()
++		if d.RcloneCompat {
++			if _, _, ok := parseRclonePart(rawName); ok {
++				// part of a rclone chunked file, surfaced as the whole file below
++				continue
++			}
++		}
+ 		if obj.IsDir() {
+ 			if name, ok := strings.CutPrefix(rawName, d.ChunkPrefix); ok {
+ 				resultIdx := len(result)
+@@ -296,6 +409,13 @@
+ 			})
+ 		}
+ 	}
++	if d.RcloneCompat {
++		for base, m := range rcloneParts {
++			if objRes, ok := newRcloneChunkObject("", base, m); ok {
++				result = append(result, objRes)
++			}
++		}
++	}
+ 	if err = listG.Wait(); err != nil {
+ 		return nil, err
+ 	}
+@@ -316,6 +436,14 @@
+ 		}
+ 		return l.Clone(), nil
+ 	}
++	// openlist chunks live in a folder named after the file, rclone chunks are
++	// siblings of the file, so resolve the folder that holds the parts.
++	partDir := remoteActualPath
++	partName := d.getPartName
++	if chunkFile.partNames != nil {
++		partDir = stdpath.Dir(remoteActualPath)
++		partName = func(idx int) string { return chunkFile.partNames[idx] }
++	}
+ 	// 检查0号块不等于-1 以支持空文件
+ 	// 如果块数量大于1 最后一块不可能为0
+ 	// 只检查中间块是否有0
+@@ -345,7 +473,7 @@
+ 		)
+ 		for idx, chunkSize := range chunkFile.chunkSizes {
+ 			if readFrom {
+-				l, o, err := op.Link(ctx, remoteStorage, stdpath.Join(remoteActualPath, d.getPartName(idx)), args)
++				l, o, err := op.Link(ctx, remoteStorage, stdpath.Join(partDir, partName(idx)), args)
+ 				if err != nil {
+ 					_ = cs.Close()
+ 					return nil, err
+@@ -386,7 +514,7 @@
+ 			} else if newStart := start - chunkSize; newStart >= 0 {
+ 				start = newStart
+ 			} else {
+-				l, o, err := op.Link(ctx, remoteStorage, stdpath.Join(remoteActualPath, d.getPartName(idx)), args)
++				l, o, err := op.Link(ctx, remoteStorage, stdpath.Join(partDir, partName(idx)), args)
+ 				if err != nil {
+ 					_ = cs.Close()
+ 					return nil, err
+diff -urN a/drivers/chunk/meta.go b/drivers/chunk/meta.go
+--- a/drivers/chunk/meta.go
++++ b/drivers/chunk/meta.go
+@@ -16,6 +16,11 @@
+ 
+ 	Thumbnail  bool `json:"thumbnail" required:"true" default:"false" help:"enable thumbnail which pre-generated under .thumbnails folder"`
+ 	ShowHidden bool `json:"show_hidden"  default:"true" required:"false" help:"show hidden directories and files"`
++
++	// RcloneCompat makes the driver also present files that were split by
++	// rclone's chunker (<name>.rclone_chunk.001, .002, ...) as one whole file.
++	// Read-only: writing still uses the openlist chunk layout above.
++	RcloneCompat bool `json:"rclone_compat" default:"false" help:"read rclone chunker layout (*.rclone_chunk.###) as whole files (read-only)"`
+ }
+ 
+ var config = driver.Config{
+diff -urN a/drivers/chunk/obj.go b/drivers/chunk/obj.go
+--- a/drivers/chunk/obj.go
++++ b/drivers/chunk/obj.go
+@@ -5,4 +5,7 @@
+ type chunkObject struct {
+ 	model.Object
+ 	chunkSizes []int64
++	// partNames is only set for rclone chunker layouts (read-only), where the
++	// parts live next to the file instead of inside a "<prefix><name>" folder.
++	partNames []string
+ }

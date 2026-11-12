@@ -43,6 +43,25 @@
 | `BEGIN IMMEDIATE`，写锁被占 3s，`busy_timeout=15000` | 等 2272ms 后成功 |
 
 
+### 0002 · 读 rclone chunker 的分块
+
+rclone 的 chunker 把大文件切成同目录下的 `<name>.rclone_chunk.001`、`.002`……
+openlist 自带的 `Chunk` 驱动用的是另一套布局（`[openlist_chunk]<name>/0`、`/1`……），
+所以 rclone 写上去的分块文件在 openlist 里只能看到一堆碎块。
+
+补丁给 `Chunk` 驱动加一个开关 `rclone_compat`（默认 `false`，**只读**）：
+
+- `List` 把 `*.rclone_chunk.###` 收起来，按原名合成一个文件条目；
+- `Get` 对单个路径同样能识别；
+- `Link` 按块序号拼接 `RangeReader`，支持任意 Range 请求；
+- 写入仍然走原来的 openlist 分块布局，不受影响。
+
+匹配用的是**纯数字后缀**，所以 rclone 失败时残留的临时对象
+（`<name>.rclone_chunk.001_ab12cd`）不会被误认成正式分块。
+
+配合 `Crypt` 驱动（密码/盐与 rclone 一致、`filename_encoding=base32768`）叠在它上面，
+openlist 里看到的就是**解密后的完整文件**。
+
 ## 构建
 
 `Actions` → `build` → `Run workflow`，填上游 tag。
