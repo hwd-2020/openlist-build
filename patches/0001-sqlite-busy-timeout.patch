@@ -5,7 +5,7 @@
  					log.Fatalf("db name error.")
  				}
 -				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental",
-+				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental&_pragma=busy_timeout(15000)",
++				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental&_pragma=busy_timeout(15000)&_txlock=immediate",
  					database.DBFile)), gormConfig)
  			}
  		case "mysql":
