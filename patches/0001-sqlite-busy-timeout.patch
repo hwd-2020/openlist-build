@@ -1,0 +1,11 @@
+--- a/internal/bootstrap/db.go
++++ b/internal/bootstrap/db.go
+@@ -50,7 +50,7 @@
+ 				if !(strings.HasSuffix(database.DBFile, ".db") && len(database.DBFile) > 3) {
+ 					log.Fatalf("db name error.")
+ 				}
+-				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental",
++				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental&_pragma=busy_timeout(15000)",
+ 					database.DBFile)), gormConfig)
+ 			}
+ 		case "mysql":

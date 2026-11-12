@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream OpenList tag to build (e.g. v4.2.9)"
+        required: true
+        default: "v4.2.9"
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.upstream_tag || 'v4.2.9' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache: false
+
+      - name: Fetch upstream source
+        run: |
+          curl -fsSL -o /tmp/src.tgz \
+            "https://codeload.github.com/OpenListTeam/OpenList/tar.gz/refs/tags/${TAG}"
+          mkdir -p src
+          tar -C src --strip-components=1 -xzf /tmp/src.tgz
+          grep -m1 '^module' src/go.mod
+
+      - name: Fetch frontend dist
+        run: |
+          curl -fsSL -o /tmp/web.tgz \
+            "https://github.com/OpenListTeam/OpenList-Frontend/releases/download/${TAG}/openlist-frontend-dist-${TAG}.tar.gz"
+          rm -rf src/public/dist
+          mkdir -p src/public/dist
+          tar -C src/public/dist -xzf /tmp/web.tgz
+          echo "dist files: $(find src/public/dist -type f | wc -l)"
+
+      - name: Apply patches
+        run: |
+          for p in patches/*.patch; do
+            echo "== applying $p"
+            patch -p1 -t -d src --no-backup-if-mismatch < "$p"
+          done
+          grep -c 'busy_timeout' src/internal/bootstrap/db.go
+
+      - name: Build
+        working-directory: src
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -o ../openlist \
+            -tags=jsoniter \
+            -ldflags "-w -s \
+              -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${TAG}' \
+              -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${TAG}' \
+              -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=patched'" \
+            .
+
+      - name: Verify
+        run: |
+          ls -lh openlist
+          file openlist
+          file openlist | grep -q 'statically linked'
+          sha256sum openlist | tee openlist.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "build-${TAG}" -y || true
+          gh release create "build-${TAG}" openlist openlist.sha256 \
+            --title "openlist ${TAG} (patched)" \
+            --notes "CGO_ENABLED=0 static linux/amd64 build of upstream ${TAG} with the patches in this repository applied."
