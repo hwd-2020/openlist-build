@@ -73,6 +73,10 @@ jobs:
           file openlist
           file openlist | grep -q 'statically linked'
           sha256sum openlist | tee openlist.sha256
+          if ! grep -q 'busy_timeout(15000)' openlist; then
+            echo "ERROR: patch marker missing in binary"
+            exit 1
+          fi
 
       - name: Publish release
         env:
